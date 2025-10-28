@@ -1,17 +1,15 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import fs from "fs/promises";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import path from "path";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { ChatOpenAI } from "@langchain/openai";
-import { RetrievalQAChain } from "langchain/chains";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import {
   AgentExecutor,
   createOpenAIFunctionsAgent,
-  initializeAgentExecutorWithOptions,
 } from "langchain/agents";
 import {
   ChatPromptTemplate,
@@ -20,14 +18,20 @@ import {
 import { getKnowledgeContext } from "./knowledgeBase.js";
 import { z } from "zod";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-// pdfjsLib.GlobalWorkerOptions.workerSrc = undefined;
-// import pdf from "pdf-parse";
-// import pdf from "pdf-parse/lib/pdf-parse.mjs";
+import YAML from "yaml";
+import { StructuredOutputParser } from "langchain/output_parsers";
+
+import {
+  uploadDocumentsFromDir,
+  uploadSingleFile,
+} from "../uploads-doc-to-pinecone.mjs";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3002;
+
+const isDev = process.env.NODE_ENV === "development";
 
 app.use((req, res, next) => {
   if (typeof res.setHeader !== "function") {
@@ -52,7 +56,6 @@ const OPENAI_API_KEY =
   process.env.VITE_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
 const INDEX_NAME = process.env.PINECONE_INDEX || "rag-scanner";
 
-// Ensure OPENAI_API_KEY is set in environment for LangChain
 if (OPENAI_API_KEY && !process.env.OPENAI_API_KEY) {
   process.env.OPENAI_API_KEY = OPENAI_API_KEY;
   console.log("✅ Set OPENAI_API_KEY in process.env for LangChain");
@@ -82,79 +85,107 @@ async function initializeServices() {
   }
 }
 
-// Extract device specifications from document text
-// async function extractDeviceSpecs(textContent) {
-//   if (!openai) {
-//     console.warn("⚠️ OpenAI not available for device spec extraction");
-//     return null;
-//   }
+// File-type aware text extraction helpers
+function detectFileType(file) {
+  const mime = (file?.mimetype || "").toLowerCase();
+  const ext = (
+    path.extname(file?.originalname || "").toLowerCase() || ""
+  ).replace(".", "");
 
-//   try {
-//     const prompt = `
-// Analyze this hardware documentation and extract device specifications.
+  // Prefer MIME when present
+  if (mime.includes("pdf")) return "pdf";
+  if (mime.includes("json")) return "json";
+  if (mime.includes("yaml") || mime.includes("yml")) return "yaml";
+  if (mime.startsWith("text/")) return "text";
 
-// IMPORTANT: This could be ANY type of hardware:
-// - Servers/Motherboards (Dell, HP, Supermicro, ASUS, etc.)
-// - Network switches (Arista, Cisco, Juniper, etc.)
-// - GPUs (NVIDIA, AMD, Intel)
-// - FPGAs (Xilinx, Intel/Altera)
-// - Storage devices (SSDs, RAID controllers)
-// - Other enterprise hardware
+  // Fallback to extension
+  if (["pdf"].includes(ext)) return "pdf";
+  if (["json"].includes(ext)) return "json";
+  if (["yaml", "yml"].includes(ext)) return "yaml";
+  if (["txt", "log", "md"].includes(ext)) return "text";
 
-// Extract these fields (use "N/A" if not applicable):
-// {
-//   "vendor": "string (manufacturer name)",
-//   "model": "string (full model name/number - REQUIRED)",
-//   "socket": "string (CPU socket type OR interface type)",
-//   "chipset": "string (chipset OR processor family)",
-//   "cpuCount": "number (CPU count OR number of ports/channels)",
-//   "ramSlots": "number (memory slots OR buffer size in GB)",
-//   "firmwareVersion": "string (firmware/BIOS version)",
-//   "deviceType": "string (server|switch|gpu|fpga|storage|network|other)"
-// }
+  return "unknown";
+}
 
-// Examples:
-// - Network Switch: vendor="Arista", model="7050SX-64", socket="N/A", chipset="Broadcom Trident II", cpuCount=64 (ports), deviceType="switch"
-// - FPGA: vendor="Xilinx", model="Zynq UltraScale+", socket="N/A", chipset="ARM Cortex-A53", cpuCount=4 (cores), deviceType="fpga"
-// - Server: vendor="Dell", model="PowerEdge R750", socket="LGA4189", chipset="Intel C621A", cpuCount=2, deviceType="server"
+async function extractTextFromPDF(buffer) {
+  try {
+    console.log("📄 PDF detected, extracting text via pdfjs-dist...");
+    const uint8Array = new Uint8Array(buffer);
+    const pdf = await pdfjsLib.getDocument({ data: uint8Array }).promise;
+    let fullText = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const text = await page.getTextContent();
+      const pageText = text.items.map((t) => t.str).join(" ");
+      fullText += pageText + "\n";
+    }
+    console.log(`Extracted ${fullText.length} chars from PDF via pdfjs-dist`);
+    return fullText;
+  } catch (err) {
+    console.warn(
+      "⚠️ pdfjs-dist failed, falling back to pdf-parse:",
+      err?.message
+    );
+    try {
+      // Lazy-load pdf-parse to avoid startup crashes in certain environments
+      let pdfParseFn;
+      try {
+        const mod = await import("pdf-parse");
+        pdfParseFn = mod?.default || mod;
+      } catch (importErr) {
+        console.warn("⚠️ Unable to load pdf-parse module:", importErr?.message);
+        // Give up on PDF fallback gracefully
+        return "";
+      }
 
-// Document content:
-// ${textContent.slice(0, 6000)}
+      const parsed = await pdfParseFn(buffer);
+      const text = parsed?.text || "";
+      console.log(`Extracted ${text.length} chars from PDF via pdf-parse`);
+      return text;
+    } catch (err2) {
+      console.error("❌ PDF extraction failed (both methods):", err2?.message);
+      // Fall back to empty text instead of throwing to avoid crashing handlers
+      return "";
+    }
+  }
+}
 
-// Return ONLY valid JSON with ALL fields filled (use "N/A" for non-applicable fields, not empty strings):`;
+async function extractTextFromUpload(file) {
+  const type = detectFileType(file);
+  try {
+    switch (type) {
+      case "pdf":
+        return await extractTextFromPDF(file.buffer);
+      case "json": {
+        const raw = file.buffer.toString("utf8");
+        try {
+          const obj = JSON.parse(raw);
+          return JSON.stringify(obj, null, 2);
+        } catch {
+          return raw; // malformed JSON; return as-is
+        }
+      }
+      case "yaml": {
+        const raw = file.buffer.toString("utf8");
+        // Keep original text to preserve comments/formatting
+        // Optional parse validation
+        try {
+          YAML.parse(raw);
+        } catch {
+          // Ignore parse errors; we'll still use raw content
+        }
+        return raw;
+      }
+      case "text":
+      case "unknown":
+      default:
+        return file.buffer.toString("utf8");
+    }
+  } finally {
+    // no-op but a convenient place for future resource cleanup
+  }
+}
 
-//     const response = await openai.chat.completions.create({
-//       model: "gpt-4o-mini",
-//       messages: [{ role: "user", content: prompt }],
-//       temperature: 0,
-//       max_tokens: 500,
-//     });
-
-//     let content = response.choices[0].message.content || "{}";
-//     content = content
-//       .replace(/```json\s*/g, "")
-//       .replace(/```\s*/g, "")
-//       .trim();
-
-//     const result = JSON.parse(content);
-
-//     // Validate that we got meaningful data (not all empty strings)
-//     const hasValidData = result.vendor || result.model || result.deviceType;
-
-//     if (!hasValidData) {
-//       console.warn(
-//         "⚠️ AI returned empty specs, likely unable to parse document"
-//       );
-//       return null;
-//     }
-
-//     console.log("🤖 AI extracted device specs:", result);
-//     return result;
-//   } catch (error) {
-//     console.error("⚠️ Device spec extraction failed:", error);
-//     return null;
-//   }
-// }
 async function extractDeviceSpecs(inputContent) {
   if (!openai) {
     console.warn("⚠️ OpenAI not available for device spec extraction");
@@ -164,30 +195,18 @@ async function extractDeviceSpecs(inputContent) {
   let textContent = "";
 
   try {
-    // 🧩 Detect if input is a Buffer (PDF file)
-    if (Buffer.isBuffer(inputContent)) {
-      console.log("📄 Detected PDF buffer, extracting text via pdfjs-dist...");
-
-      const uint8Array = new Uint8Array(inputContent);
-      const pdf = await pdfjsLib.getDocument({ data: uint8Array }).promise;
-      // const pdf = await pdfjsLib.getDocument({ data: inputContent }).promise;
-      let fullText = "";
-
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const text = await page.getTextContent();
-        const pageText = text.items.map((t) => t.str).join(" ");
-        fullText += pageText + "\n";
-      }
-
-      textContent = fullText;
-      console.log(`📖 Extracted ${textContent.length} readable characters`);
-    } else if (typeof inputContent === "string") {
-      // Text already provided (for future flexibility)
+    if (typeof inputContent === "string") {
       textContent = inputContent;
       console.log(`📖 Received plain text input (${textContent.length} chars)`);
     } else {
-      throw new Error("Invalid input: must be a text string or PDF buffer");
+      throw new Error(
+        "Invalid input: extractDeviceSpecs expects a text string"
+      );
+    }
+
+    if (!textContent || textContent.trim().length < 10) {
+      console.error("Text content too short or empty - cannot extract specs");
+      return null;
     }
 
     // 🧠 Build AI extraction prompt
@@ -226,24 +245,72 @@ Return ONLY valid JSON with ALL fields filled (use "N/A" for non-applicable fiel
 
     const response = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a hardware doc extractor. Return only a valid JSON object matching the schema. No extra text.",
+        },
+        { role: "user", content: prompt },
+      ],
       temperature: 0,
       max_tokens: 500,
     });
 
-    let content = response.choices[0].message.content || "{}";
-    content = content
-      .replace(/```json\s*/g, "")
+    let raw = response.choices[0].message.content || "{}";
+    let cleaned = raw
+      .replace(/```json\s*/gi, "")
       .replace(/```\s*/g, "")
       .trim();
 
-    const result = JSON.parse(content);
+    let result;
+    try {
+      result = JSON.parse(cleaned);
+    } catch (e) {
+      // Try to salvage a JSON object by extracting the outermost braces
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start !== -1 && end !== -1 && end > start) {
+        const slice = cleaned.slice(start, end + 1);
+        try {
+          result = JSON.parse(slice);
+        } catch (e2) {
+          // Final attempt: ask the model to repair into valid JSON (JSON mode)
+          const repairPrompt = `Fix the following into a valid JSON object matching this schema with all keys present; use \"N/A\" for unknown values:
+{
+  \"vendor\": \"string\",
+  \"model\": \"string\",
+  \"socket\": \"string\",
+  \"chipset\": \"string\",
+  \"cpuCount\": \"number\",
+  \"ramSlots\": \"number\",
+  \"firmwareVersion\": \"string\",
+  \"deviceType\": \"string\"
+}
+
+Content:\n${cleaned}`;
+
+          const repair = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: "Return only a valid JSON object." },
+              { role: "user", content: repairPrompt },
+            ],
+            temperature: 0,
+            max_tokens: 400,
+          });
+          const repaired = (repair.choices[0].message.content || "{}").trim();
+          result = JSON.parse(repaired);
+        }
+      } else {
+        throw e;
+      }
+    }
 
     // ✅ Ensure at least one key is meaningful
-    const hasValidData =
-      result.vendor !== "N/A" ||
-      result.model !== "N/A" ||
-      result.deviceType !== "N/A";
+    const hasValidData = result.vendor !== "N/A" || result.model !== "N/A";
     if (!hasValidData) {
       console.warn(
         "⚠️ AI returned empty or generic specs — check document readability"
@@ -258,6 +325,73 @@ Return ONLY valid JSON with ALL fields filled (use "N/A" for non-applicable fiel
     return null;
   }
 }
+
+const specsParser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    title: z
+      .string()
+      .describe("Title of the hardware specification or summary"),
+    sections: z
+      .array(
+        z.object({
+          name: z
+            .string()
+            .describe("Section name like Processor, Memory, etc."),
+          details: z
+            .array(z.string())
+            .describe("Bullet points for each section"),
+        })
+      )
+      .describe("List of key specification sections"),
+  })
+);
+
+// Parser for structured, citation-grounded assistant answers
+const structuredAnswerParser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    answer: z
+      .string()
+      .describe(
+        "Concise answer strictly grounded in the retrieved documents with inline citations like [docId:page]."
+      ),
+    commands: z
+      .array(
+        z.object({
+          command: z
+            .string()
+            .describe("Shell command to run; keep it single-purpose and safe."),
+          risk: z
+            .enum(["low", "medium", "high"])
+            .describe("Operational risk level of running the command."),
+          explanation: z
+            .string()
+            .describe("What the command does and why it's relevant."),
+          consent: z
+            .string()
+            .describe(
+              "Explicit consent text to show the user before execution, e.g., 'Proceed to run ... ?'"
+            ),
+        })
+      )
+      .default([])
+      .describe(
+        "Optional commands the user can run; include risk, explanation, and explicit consent text."
+      ),
+    citations: z
+      .array(z.string())
+      .default([])
+      .describe(
+        "List of citations used, e.g., [docA:1], matching the inline citations."
+      ),
+    confidence: z
+      .number()
+      .min(0)
+      .max(1)
+      .describe(
+        "Assistant's confidence based on document coverage and clarity."
+      ),
+  })
+);
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -298,12 +432,14 @@ app.post(
     }
 
     try {
-      const textContent = file.buffer.toString("utf8");
-      console.log(`📖 Text extracted (${textContent.length} chars)`);
+      const fileType = detectFileType(file);
+      const textContent = await extractTextFromUpload(file);
+      console.log(
+        `📖 Extracted ${textContent.length} characters from ${fileType.toUpperCase()}`
+      );
 
-      // Direct AI spec extraction
-      // const extractedSpecs = await extractDeviceSpecs(textContent);
-      const extractedSpecs = await extractDeviceSpecs(file.buffer);
+      // Direct AI spec extraction from normalized text
+      const extractedSpecs = await extractDeviceSpecs(textContent);
 
       const totalTime = Date.now() - startTime;
       console.log(`⚡ ULTRA-FAST extraction complete in ${totalTime}ms`);
@@ -328,118 +464,79 @@ app.post(
   }
 );
 
-// Document search endpoint - searches ALL documents in Pinecone DB
-app.post("/documents/search", async (req, res) => {
-  const {
-    query,
-    topK = 5,
-    minRelevance = 0.3,
-    model = "gpt-4o-mini",
-  } = req.body;
-
-  console.log(
-    `🔍 Search request: "${query}" (topK: ${topK}, minRelevance: ${minRelevance})`
-  );
-  console.log(`🧩 Using model for synthesis: ${model}`);
-
-  if (!index || !openai) {
-    return res.status(503).json({
-      error: "Services not available",
-      message: "Pinecone or OpenAI not initialized",
-    });
-  }
-
-  try {
-    // Generate query embedding
-    const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: query,
-      dimensions: 512,
-    });
-
-    const queryEmbedding = embeddingResponse.data[0].embedding;
-
-    // Search ALL documents in Pinecone (no filters - searches entire DB)
-    const searchResults = await index.query({
-      vector: queryEmbedding,
-      topK: parseInt(topK),
-      includeMetadata: true,
-      // No filter - searches ALL vectors in the entire database
-    });
-
-    // Filter by relevance threshold and categorize results
-    const allMatches =
-      searchResults.matches?.map((match) => ({
-        id: match.id,
-        content: match.metadata?.content || "",
-        source: match.metadata?.source || "Unknown",
-        relevance: match.score || 0,
-        category: match.metadata?.category || "hardware",
-        type: match.metadata?.type || "unknown",
-        metadata: match.metadata || {},
-      })) || [];
-
-    // Filter by minimum relevance
-    const relevantMatches = allMatches.filter(
-      (match) => match.relevance >= minRelevance
-    );
-
-    // Categorize results by document type
-    const resultsByType = {
-      hardware_docs: relevantMatches.filter(
-        (r) => r.type === "batch_upload" || r.source.includes(".md")
-      ),
-      user_uploads: relevantMatches.filter(
-        (r) => r.type === "api_uploaded_document"
-      ),
-      all_results: relevantMatches,
-    };
-
-    console.log(
-      `✅ Found ${allMatches.length} total matches, ${relevantMatches.length} above relevance threshold`
-    );
-    console.log(
-      `📚 Hardware docs: ${resultsByType.hardware_docs.length}, User uploads: ${resultsByType.user_uploads.length}`
-    );
-
-    res.json({
-      success: true,
-      query,
-      results: relevantMatches,
-      resultsByType,
-      count: relevantMatches.length,
-      totalMatches: allMatches.length,
-      hasRelevantResults: relevantMatches.length > 0,
-      searchedEntireDB: true,
-    });
-  } catch (error) {
-    console.error("❌ Search error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Search failed",
-      message: error.message,
-    });
-  }
-});
-
 app.post("/documents/answer", async (req, res) => {
   const {
     query,
     model = "gpt-4o-mini",
     conversationHistory = [],
+    appState: clientState = null,
   } = req.body || {};
-  console.log(`🧠 [Agent] Query: "${query}"`);
+  if (isDev) console.log(`🧠 [Agent] Query: "${query}"`);
 
   if (!query || query.trim().length === 0) {
     return res.status(400).json({ success: false, error: "Missing query" });
   }
 
+  // Set headers for Server-Sent Events (SSE)
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // Disable nginx buffering
+  res.flushHeaders?.();
+
+  // Helper to send SSE messages
+  const sendSSE = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  sendSSE({
+    type: "message_chunk",
+    content: "Thinking...\n",
+    fullMessage: "Thinking...\n",
+  });
+
   try {
+    // Derive a compact device/app context string from provided app state
+    const state = clientState || {};
+    const stateParts = [];
+    try {
+      const deviceLabel = state?.deviceType?.label || state?.deviceType?.id;
+      const vendor = state?.vendor || state?.model?.vendor;
+      const modelLabel = state?.model?.label || state?.model?.id;
+      const socket = state?.model?.socket || state?.boardSpecs?.socket;
+      const chipset = state?.model?.chipset || state?.boardSpecs?.chipset;
+      const cpuCount = state?.boardSpecs?.cpuCount;
+      const ramSlots = state?.boardSpecs?.ramSlots;
+      const fw = state?.boardSpecs?.firmwareVersion;
+      const bmcIp = state?.networkConfig?.bmcIp;
+      const bmcUser = state?.networkConfig?.username;
+      const bmcTested = state?.networkConfig?.tested;
+      const env = state?.environment;
+
+      if (deviceLabel) stateParts.push(`deviceType=${deviceLabel}`);
+      if (vendor) stateParts.push(`vendor=${vendor}`);
+      if (modelLabel) stateParts.push(`model=${modelLabel}`);
+      if (socket) stateParts.push(`socket=${socket}`);
+      if (chipset) stateParts.push(`chipset=${chipset}`);
+      if (Number.isFinite(cpuCount)) stateParts.push(`cpuCount=${cpuCount}`);
+      if (Number.isFinite(ramSlots)) stateParts.push(`ramSlots=${ramSlots}`);
+      if (fw) stateParts.push(`firmware=${fw}`);
+      if (bmcIp) stateParts.push(`bmcIp=${bmcIp}`);
+      if (bmcUser) stateParts.push(`bmcUser=${bmcUser}`);
+      if (typeof bmcTested === "boolean")
+        stateParts.push(`bmcTested=${bmcTested}`);
+      if (env) stateParts.push(`env=${env}`);
+    } catch {}
+    const stateStr = stateParts.length
+      ? `Device/App State: ${stateParts.join(", ")}`
+      : "Device/App State: none";
+
     // Initialize LLM with function calling support
     const llm = new ChatOpenAI({
       modelName: model,
-      temperature: 0.5, // Increased for more creative responses
+      temperature: 0.2,
       openAIApiKey: OPENAI_API_KEY,
+      streaming: true, // Enable streaming
     });
 
     // Define knowledge base search tool
@@ -463,21 +560,32 @@ app.post("/documents/answer", async (req, res) => {
           .describe("Number of results to return (default 5)"),
       }),
       func: async ({ query, topK = 5 }) => {
-        console.log(
-          `🔍 [Tool Called] search_hardware_docs with query: "${query}"`
-        );
+        if (isDev)
+          console.log(
+            `🔍 [Tool Called] search_hardware_docs with query: "${query}"`
+          );
 
         try {
-          const kb = await getKnowledgeContext(query, topK);
+          // Enrich search with vendor/model context when available
+          sendSSE({ type: "status", content: "Searching documentation..." });
+          const ctxVendor = state?.vendor || state?.model?.vendor || "";
+          const ctxModel = state?.model?.label || state?.model?.id || "";
+          const effectiveQuery = [ctxVendor, ctxModel, query]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+
+          const kb = await getKnowledgeContext(effectiveQuery || query, topK);
 
           if (!kb.success || kb.documents.length === 0) {
             console.warn("⚠️ [Tool] No docs found");
             return "No relevant documentation found in the knowledge base.";
           }
 
-          console.log(
-            `✅ [Tool Result] Found ${kb.documents.length} relevant documents`
-          );
+          if (isDev)
+            console.log(
+              `✅ [Tool Result] Found ${kb.documents.length} relevant documents`
+            );
           return kb.context; // Return formatted context string
         } catch (error) {
           console.error("❌ [Tool Error]:", error);
@@ -494,23 +602,42 @@ app.post("/documents/answer", async (req, res) => {
 
 HOW TO RESPOND:
 1. Think about the user's question first
-2. If you know the answer from your expertise, respond directly with confidence
-3. If you need specific documentation or hardware specs you don't know, THEN use the search_hardware_docs tool
+2. ALWAYS ground your answer on the Current device context provided below. If the user says "this device" or is ambiguous, assume they mean the device in the Current device context. If the chat history mentions a different device, prefer the Current device context.
+3. If you need specific documentation or hardware specs you don't know, THEN use the search_hardware_docs tool (augmenting the query with vendor/model from context)
 4. After getting tool results, synthesize the information and provide a helpful answer
-5. ALWAYS include a relevant command when applicable (wrapped in backticks)
+5. ALWAYS include one concise, most-relevant command when applicable (wrapped in backticks). Avoid repeating the same command multiple times.
+6. If the device context is missing critical details (e.g., vendor/model) and the question depends on them, ask ONE short clarifying question before giving a general best-effort answer.
 
 RESPONSE FORMAT:
 - Provide clear, concise explanations (2-3 sentences)
 - Include bash/shell commands in backticks: \`command here\`
+- When suggesting a command, append the risk level in brackets after the command: [RISK: low/medium/high]
 - Be conversational and helpful
 - Never return empty responses - always provide an answer
 
+RISK LEVELS FOR COMMANDS:
+- LOW: Read-only commands that cannot harm the system (ls, cat, free, top, nvidia-smi, lspci, dmesg, etc.)
+- MEDIUM: Commands that modify configuration or restart services (systemctl restart, apt-get install, chmod, mkdir, etc.)
+- HIGH: Destructive or dangerous commands (rm -rf, dd, mkfs, shutdown, reboot, chmod 777, kill -9, etc.)
+
 EXAMPLES:
 User: "How do I check NVIDIA GPU temperature?"
-You: "To monitor NVIDIA GPU temperature, use \`nvidia-smi\` which displays real-time temperature, utilization, and memory usage. You can also use \`watch -n 1 nvidia-smi\` for continuous monitoring."
+You: "To monitor NVIDIA GPU temperature, use \`nvidia-smi\` which displays real-time temperature, utilization, and memory usage. You can also use \`watch -n 1 nvidia-smi\` for continuous monitoring. [RISK: low]"
 
 User: "What's the best way to diagnose memory issues?"
-You: "Start with \`free -h\` to check overall memory usage, then use \`vmstat 1\` to monitor memory statistics in real-time. For detailed per-process analysis, run \`top\` or \`htop\`."
+You: "Start with \`free -h\` to check overall memory usage, then use \`vmstat 1\` to monitor memory statistics in real-time. For detailed per-process analysis, run \`top\` or \`htop\`. [RISK: low]"
+
+User: "How do I check if my server is overheating?"
+You: "To monitor temperature sensors on your Dell PowerEdge R620, you can use the ipmitool command:
+
+\`\`\`bash
+ipmitool sdr type Temperature
+\`\`\`
+[RISK: low]
+
+This displays temperature readings from all available sensors, helping you identify any overheating components."
+
+Current device context (ground truth): {state}
 
 Current conversation context: {context}`,
       ],
@@ -538,150 +665,365 @@ Current conversation context: {context}`,
       prompt: agentPrompt,
     });
 
-    console.log("🤖 [Agent] Starting execution...");
+    if (isDev) console.log("🤖 [Agent] Starting execution...");
     const agentExecutor = new AgentExecutor({
       agent,
       tools: [knowledgeBaseTool],
-      verbose: true,
-      maxIterations: 5,
+      verbose: false,
+      maxIterations: 1,
     });
-    let result;
+
+    let fullOutput = "";
+    let streamedTokens = 0;
+
     try {
-      // const agentExecutor = await initializeAgentExecutorWithOptions(
-      //   [knowledgeBaseTool],
-      //   llm,
-      //   {
-      //     agentType: "openai-functions", // ensures tool->LLM->final answer loop
-      //     verbose: true,
-      //     maxIterations: 5,
-      //   }
-      // );
-      // // Execute agent call
-      // result = await agentExecutor.call({
-      //   input: query,
-      //   context: contextStr,
-      // });
-      console.log("🤖 [Agent] Starting execution...");
-      result = await agentExecutor.invoke({
-        input: query,
-        context: contextStr,
-      });
-    } catch (invokeError) {
-      console.error("❌ [Agent] Invocation error:", invokeError.message);
-      console.error("Stack:", invokeError.stack);
+      // Use LangChain's native .stream() method for robust streaming
+      if (isDev)
+        console.log(
+          "🤖 [Agent] Starting streaming execution with tools: search_hardware_docs"
+        );
 
-      // Fallback to direct LLM response if agent fails completely
-      console.log("🔄 [Agent] Falling back to direct LLM...");
-      const fallbackResponse = await llm.invoke([
+      const callbacks = [
         {
-          role: "system",
-          content:
-            "You are Basil, a helpful hardware diagnostics assistant. Provide clear, concise answers with relevant commands.",
+          handleToolStart(tool, input) {
+            sendSSE({
+              type: "status",
+              content: `Searching documentation for: "${input.query}"...`,
+            });
+          },
+          handleToolEnd(output) {
+            sendSSE({
+              type: "status",
+              content: "Documentation found. Generating answer...",
+            });
+          },
+          handleLLMNewToken(token) {
+            fullOutput += token;
+            streamedTokens++;
+            sendSSE({
+              type: "message_chunk",
+              content: token,
+              fullMessage: fullOutput,
+            });
+          },
+          handleLLMEnd() {
+            console.log(`✅ Stream completed (${streamedTokens} tokens)`);
+          },
         },
-        { role: "user", content: query },
-      ]);
+      ];
 
-      result = {
-        output:
-          fallbackResponse.content ||
-          "I apologize, but I encountered an error processing your request.",
-        intermediateSteps: [],
-      };
-    }
-
-    console.log("✅ [Agent] Execution complete");
-    console.log("📤 [Agent] Raw output:", result.output);
-    console.log("📤 [Agent] Output type:", typeof result.output);
-    console.log("📤 [Agent] Output length:", result.output?.length);
-    console.log(
-      "📊 [Agent] Intermediate steps:",
-      result.intermediateSteps?.length || 0
-    );
-
-    // Check if output is valid
-    if (!result.output || result.output.trim().length === 0) {
-      console.error(
-        "⚠️ [Agent] No output generated - returning generic message"
-      );
-      return res.json({
-        success: true,
-        source: "langchain-agent",
-        answer:
-          "I apologize, but I couldn't generate a response. The knowledge base might not be available. However, I can help with general hardware diagnostics questions.",
-        assistant_response: {
-          message:
-            "I apologize, but I couldn't generate a response. The knowledge base might not be available. However, I can help with general hardware diagnostics questions.",
-          command_text: "N/A",
-          command: "N/A",
-          confidence: 0.3,
-          sources: [],
+      const stream = await agentExecutor.stream(
+        {
+          input: query,
+          chat_history: conversationHistory,
+          context: contextStr || "No previous context available",
+          state: stateStr,
         },
-        toolCalls: 0,
-      });
-    }
-
-    // Extract command from agent's response (natural language parsing)
-    let extractedCommand = "";
-    let commandText = "Check GPU Temperature";
-
-    // Look for code blocks (triple backticks or single backticks)
-    // First try triple backticks (```bash\ncommand\n```)
-    let codeBlockMatch = result.output.match(
-      /```(?:bash|sh)?\s*\n([^\n]+)\n```/
-    );
-
-    if (!codeBlockMatch) {
-      // Try single backticks (`command`)
-      codeBlockMatch = result.output.match(/`([^`]+)`/);
-    }
-
-    if (codeBlockMatch) {
-      extractedCommand = codeBlockMatch[1].trim();
-
-      // Extract a title for the command from the text before it
-      const beforeCommand = result.output.substring(
-        0,
-        result.output.indexOf(codeBlockMatch[0])
+        {
+          callbacks,
+        }
       );
-      const titleMatch = beforeCommand.match(
-        /(?:check|using?|run|execute|command|display|monitor|show)[\s:]+([^.!?\n]{5,50})/i
-      );
-      if (titleMatch) {
-        commandText = titleMatch[1].trim().replace(/^the\s+/i, "");
+
+      // Process the stream
+      let result = { output: "", intermediateSteps: [] };
+      for await (const chunk of stream) {
+        // Agent executor streams different event types
+        if (chunk.agent) {
+          // Agent reasoning step
+          console.log("🤔 [Agent] Reasoning:", chunk.agent);
+        } else if (chunk.actions) {
+          // Tool invocation
+          console.log("🔧 [Agent] Invoking tools:", chunk.actions);
+        } else if (chunk.steps) {
+          // Tool results
+          console.log("📊 [Agent] Tool results:", chunk.steps);
+          result.intermediateSteps = chunk.steps;
+        } else if (chunk.output) {
+          // Final output
+          result.output = chunk.output;
+          console.log("✅ [Agent] Final output received");
+        }
       }
 
-      console.log(`✅ [Agent] Extracted command: "${extractedCommand}"`);
-      console.log(`✅ [Agent] Command title: "${commandText}"`);
-    } else {
-      console.log(`⚠️ [Agent] No command found in response`);
+      // If we didn't get output from stream, use fullOutput
+      if (!result.output && fullOutput) {
+        result.output = fullOutput;
+      }
+
+      if (isDev) console.log("✅ [Agent] Stream execution complete");
+      if (isDev)
+        console.log("📤 [Agent] Raw output:", result.output || fullOutput);
+
+      let structuredSpecs = null;
+      try {
+        // Ask model again to structure if it looks like a hardware spec
+        if (/spec/i.test(query) || /specification/i.test(result.output)) {
+          const formatInstructions = specsParser.getFormatInstructions();
+
+          if (isDev) console.log("🧩 [Parser] Structuring output...");
+          const structuredPrompt = `
+        Restructure the following hardware specification into JSON:
+        ${formatInstructions}
+        Content:
+        ${result.output}
+        `;
+
+          const structuredResponse = await llm.invoke([
+            {
+              role: "system",
+              content: "You are a JSON formatter for hardware specifications.",
+            },
+            { role: "user", content: structuredPrompt },
+          ]);
+
+          structuredSpecs = await specsParser.parse(structuredResponse.content);
+          if (isDev)
+            console.log(
+              "✅ [Parser] Parsed structured specs:",
+              structuredSpecs
+            );
+          if (structuredSpecs) {
+            let formatted = `\n\n${structuredSpecs.title.toUpperCase()}\n`;
+            structuredSpecs.sections.forEach((sec) => {
+              formatted += `\n${sec.name}:\n`;
+              sec.details.forEach((d) => {
+                formatted += `• ${d}\n`;
+              });
+            });
+            result.output += formatted;
+          }
+        }
+      } catch (parseErr) {
+        console.warn(
+          "⚠️ [Parser] Failed to structure specs:",
+          parseErr.message
+        );
+      }
+      if (isDev) console.log("📤 [Agent] Output type:", typeof result.output);
+      if (isDev)
+        console.log("📤 [Agent] Output length:", result.output?.length);
+      if (isDev)
+        console.log(
+          "📊 [Agent] Intermediate steps:",
+          result.intermediateSteps?.length || 0
+        );
+
+      // Use streamed output or fallback to result.output
+      const finalOutput = fullOutput || result.output || "";
+
+      // Check if output is valid; if not, perform a robust fallback that still answers the user
+      if (!finalOutput || finalOutput.trim().length === 0) {
+        console.warn("⚠️ [Agent] Empty output. Performing RAG+LLM fallback...");
+
+        // Try to retrieve some context directly from the knowledge base
+        let kbContext = "";
+        let kbSources = [];
+        try {
+          // const kb = await getKnowledgeContext(query, 5);
+
+          const ctxVendor = state?.vendor || state?.model?.vendor || "";
+          const ctxModel = state?.model?.label || state?.model?.id || "";
+          const effectiveQuery = [ctxVendor, ctxModel, query]
+            .filter(Boolean)
+            .join(" ")
+            .trim();
+
+          const kbPromise = getKnowledgeContext(effectiveQuery || query, 5);
+          sendSSE({ type: "status", content: "Retrieving docs from KB..." });
+          const kb = await kbPromise;
+          if (kb?.success && kb?.context) {
+            kbContext = kb.context;
+            kbSources =
+              kb.documents?.map((d) => d.metadata?.source).filter(Boolean) ||
+              [];
+          }
+        } catch (e) {
+          console.warn(
+            "⚠️ [Fallback] Knowledge base lookup failed:",
+            e.message
+          );
+        }
+
+        // Ask the model directly, optionally conditioning on retrieved context
+        const directPrompt = kbContext
+          ? `You're Basil, an expert hardware diagnostics assistant. Use the device/app state and the context below to answer the user's question in 2-3 sentences and include a relevant bash command in backticks when applicable.\n\n${stateStr}\n\nContext:\n${kbContext}\n\nQuestion: ${query}`
+          : `You're Basil, an expert hardware diagnostics assistant. Use the device/app state to tailor your answer. Respond in 2-3 sentences and include a relevant bash command in backticks when applicable.\n\n${stateStr}\n\nQuestion: ${query}`;
+
+        const direct = await llm.invoke(
+          [
+            {
+              role: "system",
+              content:
+                "Be concise, accurate, and include commands when useful.",
+            },
+            { role: "user", content: directPrompt },
+          ],
+          {
+            callbacks: [
+              {
+                handleLLMNewToken(token) {
+                  fullOutput += token;
+                  sendSSE({
+                    type: "message_chunk",
+                    content: token,
+                    fullMessage: fullOutput,
+                  });
+                },
+              },
+            ],
+          }
+        );
+
+        const outputText =
+          typeof direct?.content === "string"
+            ? direct.content
+            : Array.isArray(direct?.content)
+              ? direct.content
+                  .map((c) => (typeof c === "string" ? c : c?.text))
+                  .join("\n")
+              : fullOutput || "";
+
+        // Extract risk level from anywhere in the output
+        let riskLevel = "medium";
+        const riskMatch = outputText.match(/\[RISK:\s*(low|medium|high)\]/i);
+        if (riskMatch) {
+          riskLevel = riskMatch[1].toLowerCase();
+        }
+
+        // Extract a command if present
+        let extractedCommand = "";
+        let commandText = "";
+        let codeBlockMatch = outputText.match(
+          /```(?:bash|sh)?\s*\n([^\n]+)\n```/
+        );
+        if (!codeBlockMatch) codeBlockMatch = outputText.match(/`([^`]+)`/);
+        if (codeBlockMatch) {
+          extractedCommand = codeBlockMatch[1].trim();
+          // Clean up any [RISK: ...] tags from inside the command
+          extractedCommand = extractedCommand
+            .replace(/\s*\[RISK:\s*(low|medium|high)\]\s*/gi, "")
+            .trim();
+
+          const beforeCommand = outputText.substring(
+            0,
+            outputText.indexOf(codeBlockMatch[0])
+          );
+          const titleMatch = beforeCommand.match(
+            /(?:check|using?|run|execute|command|display|monitor|show)[\s:]+([^.!?\n]{5,50})/i
+          );
+          if (titleMatch)
+            commandText = titleMatch[1].trim().replace(/^the\s+/i, "");
+        }
+
+        // Clean message by removing [RISK: ...] tags
+        const cleanOutputText = outputText
+          .replace(/\[RISK:\s*(low|medium|high)\]/gi, "")
+          .trim();
+
+        // Send final complete message via SSE
+        sendSSE({
+          type: "complete",
+          data: {
+            message: cleanOutputText || "I'm here to help with that device.",
+            command_text: commandText || (extractedCommand ? "Command" : "N/A"),
+            command: extractedCommand || "N/A",
+            risk: riskLevel,
+            confidence: 1,
+            sources: kbSources,
+          },
+        });
+
+        res.end();
+        return;
+      }
+
+      // Extract risk level from anywhere in the output
+      let riskLevel = "medium";
+      const riskMatch = finalOutput.match(/\[RISK:\s*(low|medium|high)\]/i);
+      if (riskMatch) {
+        riskLevel = riskMatch[1].toLowerCase();
+        if (isDev)
+          console.log(`✅ [Agent] Extracted risk level: "${riskLevel}"`);
+      } else {
+        if (isDev)
+          console.log(`⚠️ [Agent] No risk level found, defaulting to "medium"`);
+      }
+
+      let extractedCommand = "";
+      let commandText = "";
+
+      let codeBlockMatch = finalOutput.match(
+        /```(?:bash|sh)?\s*\n([^\n]+)\n```/
+      );
+
+      if (!codeBlockMatch) {
+        codeBlockMatch = finalOutput.match(/`([^`]+)`/);
+      }
+
+      if (codeBlockMatch) {
+        extractedCommand = codeBlockMatch[1].trim();
+
+        // Clean up any [RISK: ...] tags from inside the command
+        extractedCommand = extractedCommand
+          .replace(/\s*\[RISK:\s*(low|medium|high)\]\s*/gi, "")
+          .trim();
+
+        const beforeCommand = finalOutput.substring(
+          0,
+          finalOutput.indexOf(codeBlockMatch[0])
+        );
+        const titleMatch = beforeCommand.match(
+          /(?:check|using?|run|execute|command|display|monitor|show)[\s:]+([^.!?\n]{5,50})/i
+        );
+        if (titleMatch) {
+          commandText = titleMatch[1].trim().replace(/^the\s+/i, "");
+        }
+
+        if (isDev)
+          console.log(`✅ [Agent] Extracted command: "${extractedCommand}"`);
+        if (isDev) console.log(`✅ [Agent] Command title: "${commandText}"`);
+      } else {
+        if (isDev) console.log(`⚠️ [Agent] No command found in response`);
+      }
+
+      // Clean message by removing [RISK: ...] tags
+      const cleanMessage = finalOutput
+        .replace(/\[RISK:\s*(low|medium|high)\]/gi, "")
+        .trim();
+
+      // Send final complete message via SSE
+      sendSSE({
+        type: "complete",
+        data: {
+          message: cleanMessage,
+          command_text: commandText || "N/A",
+          command: extractedCommand || "N/A",
+          risk: riskLevel,
+          confidence: result.intermediateSteps?.length > 0 ? 0.9 : 0.8,
+          sources:
+            result.intermediateSteps?.length > 0
+              ? ["Hardware Documentation KB"]
+              : [],
+          toolCalls: result.intermediateSteps?.length || 0,
+        },
+      });
+
+      res.end();
+    } catch (err) {
+      console.error("❌ [Agent Error]:", err);
+      sendSSE({
+        type: "error",
+        error: err.message,
+      });
+      res.end();
     }
-
-    // Build structured response from agent output
-    const assistant_response = {
-      message: result.output,
-      command_text: commandText,
-      command: extractedCommand || "N/A",
-      confidence: result.intermediateSteps?.length > 0 ? 0.9 : 0.8,
-      sources:
-        result.intermediateSteps?.length > 0
-          ? ["Hardware Documentation KB"]
-          : [],
-    };
-
-    return res.json({
-      success: true,
-      source: "langchain-agent",
-      answer: assistant_response.message,
-      assistant_response,
-      toolCalls: result.intermediateSteps?.length || 0,
-    });
   } catch (err) {
-    console.error("❌ [Agent Error]:", err);
-    res.status(500).json({
-      success: false,
-      error: "Agent execution failed",
-      message: err.message,
+    console.error("❌ [Outer Error]:", err);
+    sendSSE({
+      type: "error",
+      error: err.message,
     });
+    res.end();
   }
 });
 
@@ -745,15 +1087,15 @@ app.post(
     }
 
     try {
-      // Extract text content
-      const textContent = file.buffer.toString("utf8");
+      const fileType = detectFileType(file);
+      const textContent = await extractTextFromUpload(file);
       console.log(
-        `📖 Extracted ${textContent.length} characters (${Date.now() - startTime}ms)`
+        `📖 Extracted ${textContent.length} characters from ${fileType.toUpperCase()} (${Date.now() - startTime}ms)`
       );
 
       // OPTIMIZATION 1: Extract device specs FIRST (fastest operation)
       const specsStartTime = Date.now();
-      const extractedSpecs = await extractDeviceSpecs(file.buffer);
+      const extractedSpecs = await extractDeviceSpecs(textContent);
       // const extractedSpecs = await extractDeviceSpecs(textContent);
       console.log(`🤖 Specs extracted in ${Date.now() - specsStartTime}ms`);
 
@@ -896,8 +1238,8 @@ app.post("/documents/upload", upload.single("document"), async (req, res) => {
 
   try {
     // Extract text content
-    const textContent = file.buffer.toString("utf8");
-    console.log(`📖 Extracted ${textContent.length} characters`);
+    const textContent = await extractTextFromUpload(file);
+    console.log(`📖 Extracted ${textContent.length} characters for chunking`);
 
     // Simple chunking
     const chunkSize = 800;
@@ -972,6 +1314,38 @@ app.post("/documents/upload", upload.single("document"), async (req, res) => {
       error: "Upload processing failed",
       message: error.message,
     });
+  }
+});
+
+app.post("/pinecone/upload", upload.single("document"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: "No file uploaded" });
+  }
+
+  try {
+    const result = await uploadSingleFile(req.file);
+    res.json({
+      success: true,
+      message: `Uploaded ${req.file.originalname}`,
+      ...result,
+    });
+  } catch (error) {
+    console.error("❌ Pinecone upload error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/pinecone/upload-dir", async (req, res) => {
+  try {
+    const result = await uploadDocumentsFromDir("./docs");
+    res.json({
+      success: true,
+      message: "All documents uploaded successfully",
+      result,
+    });
+  } catch (error) {
+    console.error("❌ Bulk Pinecone upload error:", error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
